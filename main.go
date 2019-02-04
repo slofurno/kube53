@@ -64,7 +64,6 @@ func withretry(f func() error) error {
 			return err
 		}
 		time.Sleep(time.Second + time.Millisecond*400*(1<<i))
-		fmt.Fprintf(os.Stderr, "%v\n", err)
 	}
 	return err
 }
@@ -268,6 +267,11 @@ func (s *awssvc) GetLoadBalancers() (map[string]string, error) {
 
 func main() {
 
+	dev := ioutil.Discard
+	if os.Getenv("DEBUG") != "" {
+		dev = os.Stderr
+	}
+
 	cfg, err := external.LoadDefaultAWSConfig()
 	if err != nil {
 		panic(err)
@@ -290,7 +294,7 @@ func main() {
 	}
 
 	for k, zone := range zones {
-		fmt.Println(k, zone)
+		fmt.Fprintln(dev, k, zone)
 	}
 
 	actual, err := svc.GetRecordSets(zones)
@@ -309,20 +313,22 @@ func main() {
 			panic(err)
 		}
 
-		fmt.Fprintln(os.Stderr, "comparing expected to actual records")
+		fmt.Fprintln(dev, "comparing expected to actual records")
 		for k, target := range expected {
-			fmt.Printf("%s (private: %t) expected: %s, actual: %s\n", k.domainname, k.private, target, actual[k])
+			fmt.Fprintf(dev, "%s (private: %t) expected: %s, actual: %s\n", k.domainname, k.private, target, actual[k])
 			if target != actual[k] {
+
+				fmt.Fprintf(os.Stderr, "setting target for %s from %s -> %s\n", k.domainname, actual[k], target)
 				tld := getTLD(k.domainname)
 				zone, ok := zones[key{domainname: tld, private: k.private}]
 				if !ok {
-					fmt.Printf("missing zone for domain: %s\n", k.domainname)
+					fmt.Fprintf(dev, "missing zone for domain: %s\n", k.domainname)
 					continue
 				}
 
 				targetzone, ok := loadbalancers[target]
 				if !ok {
-					fmt.Printf("missing target zone for elb: %s\n", target)
+					fmt.Fprintf(dev, "missing target zone for elb: %s\n", target)
 					loadbalancers, err = svc.GetLoadBalancers()
 					if err != nil {
 						panic(err)
@@ -330,10 +336,10 @@ func main() {
 					continue
 				}
 
-				fmt.Fprintf(os.Stderr, "updating record for: %s in zone: %s\n", k.domainname, zone)
+				fmt.Fprintf(dev, "updating record for: %s in zone: %s\n", k.domainname, zone)
 				err := svc.UpdateRecord(zone, k.domainname, target, targetzone)
 				if err != nil {
-					fmt.Fprintln(os.Stderr, err)
+					fmt.Fprintln(dev, err)
 				} else {
 					actual[k] = target
 				}
