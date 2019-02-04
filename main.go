@@ -14,7 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/external"
-	"github.com/aws/aws-sdk-go-v2/service/elbv2"
+	"github.com/aws/aws-sdk-go-v2/service/elb"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 )
 
@@ -49,7 +49,7 @@ type key struct {
 type awssvc struct {
 	route53 *route53.Route53
 	client  *http.Client
-	elb     *elbv2.ELBV2
+	elb     *elb.ELB
 }
 
 func withretry(f func() error) error {
@@ -80,33 +80,31 @@ func processRecords(records []route53.ResourceRecordSet, actual map[key]string, 
 	}
 }
 
-func (s *awssvc) UpdateRecord(zone, dnsname, target string) error {
+func (s *awssvc) UpdateRecord(zone, dnsname, target, targetzone string) error {
 	parts := strings.Split(zone, "/")
 	zone = parts[len(parts)-1]
-	err := withretry(func() error {
-		_, err := s.route53.ChangeResourceRecordSetsRequest(&route53.ChangeResourceRecordSetsInput{
-			HostedZoneId: aws.String(zone),
-			ChangeBatch: &route53.ChangeBatch{
-				Changes: []route53.Change{
-					route53.Change{
-						Action: "UPSERT",
-						ResourceRecordSet: &route53.ResourceRecordSet{
-							Type: route53.RRTypeA,
-							Name: aws.String(dnsname + "."),
-							AliasTarget: &route53.AliasTarget{
-								DNSName:              aws.String(target + "."),
-								HostedZoneId:         aws.String(zone),
-								EvaluateTargetHealth: aws.Bool(false),
-							},
+	//return withretry(func() error {
+	_, err := s.route53.ChangeResourceRecordSetsRequest(&route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(zone),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: []route53.Change{
+				route53.Change{
+					Action: "UPSERT",
+					ResourceRecordSet: &route53.ResourceRecordSet{
+						Type: route53.RRTypeA,
+						Name: aws.String(dnsname + "."),
+						AliasTarget: &route53.AliasTarget{
+							DNSName:              aws.String(target + "."),
+							HostedZoneId:         aws.String(targetzone),
+							EvaluateTargetHealth: aws.Bool(false),
 						},
 					},
 				},
 			},
-		}).Send()
-		return err
-	})
-
+		},
+	}).Send()
 	return err
+	//})
 }
 
 func (s *awssvc) GetExpectedRecordSets() (map[key]string, error) {
@@ -228,12 +226,12 @@ func (s *awssvc) GetRecordSets(zones map[key]string) (map[key]string, error) {
 
 func (s *awssvc) GetLoadBalancers() (map[string]string, error) {
 	ret := map[string]string{}
-	var next *string
+	var next string
 	for {
-		var out *elbv2.DescribeLoadBalancersOutput
-		input := &elbv2.DescribeLoadBalancersInput{}
-		if next != nil {
-			input.Marker = next
+		var out *elb.DescribeLoadBalancersOutput
+		input := &elb.DescribeLoadBalancersInput{}
+		if next != "" {
+			input.Marker = aws.String(next)
 		}
 
 		err := withretry(func() error {
@@ -245,17 +243,17 @@ func (s *awssvc) GetLoadBalancers() (map[string]string, error) {
 			return nil, err
 		}
 
-		for _, lb := range out.LoadBalancers {
+		for _, lb := range out.LoadBalancerDescriptions {
+			zone := *lb.CanonicalHostedZoneNameID
 			domain := *lb.DNSName
-			zone := *lb.CanonicalHostedZoneId
 			ret[domain] = zone
 		}
 
-		fmt.Printf("got %d loadbalancers\n", len(out.LoadBalancers))
-		fmt.Println(out.NextMarker)
-
-		next = out.NextMarker
-		if next == nil || *next == "" {
+		if out.NextMarker == nil {
+			break
+		}
+		next = *out.NextMarker
+		if next == "" {
 			break
 		}
 	}
@@ -266,7 +264,7 @@ func (s *awssvc) GetLoadBalancers() (map[string]string, error) {
 
 func main() {
 
-	b, _ := ioutil.ReadFile("./services2.json")
+	b, _ := ioutil.ReadFile("./services.json")
 	services := ServicesResponse{}
 	err := json.Unmarshal(b, &services)
 	if err != nil {
@@ -304,7 +302,7 @@ func main() {
 
 	svc := awssvc{
 		route53: route53.New(cfg),
-		elb:     elbv2.New(cfg),
+		elb:     elb.New(cfg),
 		//client:  client,
 	}
 
@@ -327,30 +325,37 @@ func main() {
 		panic(err)
 	}
 
-	for lb, zone := range loadbalancers {
-		fmt.Println(lb, zone)
-	}
+	for {
+		fmt.Fprintln(os.Stderr, "comparing expected to actual records")
+		for k, target := range expected {
+			pre := ""
+			if target != actual[k] {
+				tld := getTLD(k.domainname)
+				zone, ok := zones[key{domainname: tld, private: k.private}]
+				if !ok {
+					fmt.Printf("missing zone for domain: %s\n", k.domainname)
+					continue
+				}
 
-	os.Exit(0)
+				targetzone, ok := loadbalancers[target]
+				if !ok {
+					fmt.Printf("missing target zone for elb: %s\n", target)
+					continue
+				}
 
-	for k, target := range expected {
-		pre := ""
-		if target != actual[k] {
-			tld := getTLD(k.domainname)
-			zone, ok := zones[key{domainname: tld, private: k.private}]
-			if !ok {
-				fmt.Printf("missing zone for domain: %s\n", k.domainname)
-				continue
+				fmt.Fprintf(os.Stderr, "updating record for: %s in zone: %s\n", k.domainname, zone)
+				err := svc.UpdateRecord(zone, k.domainname, target, targetzone)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+				} else {
+					actual[k] = target
+				}
+				pre = "NEEDS UPDATE "
 			}
-
-			fmt.Fprintf(os.Stderr, "updating record for: %s in zone: %s\n", k.domainname, zone)
-			err := svc.UpdateRecord(zone, k.domainname, target)
-			if err != nil {
-				panic(err)
-			}
-			pre = "NEEDS UPDATE "
+			fmt.Printf("%s %s (private: %t) expected: %s, actual: %s\n", pre, k.domainname, k.private, target, actual[k])
 		}
-		fmt.Printf("%s %s (private: %t) expected: %s, actual: %s\n", pre, k.domainname, k.private, target, actual[k])
+
+		time.Sleep(time.Second * 10)
 	}
 
 }
