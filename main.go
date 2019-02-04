@@ -60,7 +60,7 @@ func withretry(f func() error) error {
 			return nil
 		}
 
-		if !aws.IsErrorRetryable(err) {
+		if !aws.IsErrorRetryable(err) && !aws.IsErrorThrottle(err) {
 			return err
 		}
 		time.Sleep(time.Second + time.Millisecond*400*(1<<i))
