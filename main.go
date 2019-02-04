@@ -8,8 +8,11 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/external"
 	"github.com/aws/aws-sdk-go-v2/service/elbv2"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
@@ -43,9 +46,227 @@ type key struct {
 	private    bool
 }
 
+type awssvc struct {
+	route53 *route53.Route53
+	client  *http.Client
+	elb     *elbv2.ELBV2
+}
+
+func withretry(f func() error) error {
+	var err error
+	var i uint
+	for i = 0; i < 10; i++ {
+		if err = f(); err == nil {
+			return nil
+		}
+		time.Sleep(time.Second + time.Millisecond*400*(1<<i))
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
+	return err
+}
+
+func processRecords(records []route53.ResourceRecordSet, actual map[key]string, isPrivate bool) {
+	for _, record := range records {
+		if record.Type == route53.RRTypeA {
+			if record.AliasTarget == nil {
+				//fmt.Println(record.String())
+				continue
+			}
+			target := stripLastDot(*record.AliasTarget.DNSName)
+			name := stripLastDot(*record.Name)
+
+			actual[key{name, isPrivate}] = target
+		}
+	}
+}
+
+func (s *awssvc) UpdateRecord(zone, dnsname, target string) error {
+	parts := strings.Split(zone, "/")
+	zone = parts[len(parts)-1]
+	err := withretry(func() error {
+		_, err := s.route53.ChangeResourceRecordSetsRequest(&route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(zone),
+			ChangeBatch: &route53.ChangeBatch{
+				Changes: []route53.Change{
+					route53.Change{
+						Action: "UPSERT",
+						ResourceRecordSet: &route53.ResourceRecordSet{
+							Type: route53.RRTypeA,
+							Name: aws.String(dnsname + "."),
+							AliasTarget: &route53.AliasTarget{
+								DNSName:              aws.String(target + "."),
+								HostedZoneId:         aws.String(zone),
+								EvaluateTargetHealth: aws.Bool(false),
+							},
+						},
+					},
+				},
+			},
+		}).Send()
+		return err
+	})
+
+	return err
+}
+
+func (s *awssvc) GetExpectedRecordSets() (map[key]string, error) {
+	req, err := http.NewRequest("GET", "https://kubernetes.default.svc.cluster.local/api/v1/services", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	token, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("authorization", "Bearer "+string(token))
+
+	res, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer res.Body.Close()
+
+	b, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	services := ServicesResponse{}
+	if err := json.Unmarshal(b, &services); err != nil {
+		return nil, err
+	}
+
+	expected := map[key]string{}
+
+	for _, service := range services.Items {
+		private := service.Metadata.Annotations.Internal != ""
+		if len(service.Status.LoadBalancer.Ingress) > 0 {
+			if len(service.Status.LoadBalancer.Ingress) != 1 {
+				panic("unexpected ingress length")
+			}
+
+			domainname := service.Metadata.Annotations.DomainName
+			if domainname == "" {
+				continue
+			}
+			elb := service.Status.LoadBalancer.Ingress[0].Hostname
+			if elb == "" {
+				continue
+			}
+			expected[key{domainname, private}] = elb
+		}
+	}
+
+	return expected, nil
+}
+
+func (s *awssvc) GetZones() (map[key]string, error) {
+	var hostedzones []route53.HostedZone
+	err := withretry(func() error {
+		hz, err := s.route53.ListHostedZonesRequest(&route53.ListHostedZonesInput{}).Send()
+		if err != nil {
+			return err
+		}
+		hostedzones = hz.HostedZones
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ret := map[key]string{}
+	for _, zone := range hostedzones {
+		domain := stripLastDot(*zone.Name)
+		k := key{domainname: domain, private: *zone.Config.PrivateZone}
+		ret[k] = *zone.Id
+	}
+	return ret, nil
+}
+
+func (s *awssvc) GetRecordSets(zones map[key]string) (map[key]string, error) {
+
+	actual := map[key]string{}
+
+	for k, zone := range zones {
+		keepgoing := true
+		isPrivate := k.private
+		id := aws.String(zone)
+		var records *route53.ListResourceRecordSetsOutput
+
+		for keepgoing {
+			input := &route53.ListResourceRecordSetsInput{
+				HostedZoneId: id,
+			}
+
+			if records != nil {
+				input.StartRecordName = records.NextRecordName
+				input.StartRecordType = records.NextRecordType
+			}
+
+			err := withretry(func() error {
+				var err error
+				records, err = s.route53.ListResourceRecordSetsRequest(input).Send()
+				if err != nil {
+					return err
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			processRecords(records.ResourceRecordSets, actual, isPrivate)
+
+			keepgoing = records.IsTruncated != nil && *records.IsTruncated == true
+		}
+	}
+
+	return actual, nil
+}
+
+func (s *awssvc) GetLoadBalancers() (map[string]string, error) {
+	ret := map[string]string{}
+	var next *string
+	for {
+		var out *elbv2.DescribeLoadBalancersOutput
+		input := &elbv2.DescribeLoadBalancersInput{}
+		if next != nil {
+			input.Marker = next
+		}
+
+		err := withretry(func() error {
+			var err error
+			out, err = s.elb.DescribeLoadBalancersRequest(input).Send()
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, lb := range out.LoadBalancers {
+			domain := *lb.DNSName
+			zone := *lb.CanonicalHostedZoneId
+			ret[domain] = zone
+		}
+
+		fmt.Printf("got %d loadbalancers\n", len(out.LoadBalancers))
+		fmt.Println(out.NextMarker)
+
+		next = out.NextMarker
+		if next == nil || *next == "" {
+			break
+		}
+	}
+
+	return ret, nil
+
+}
+
 func main() {
 
-	b, _ := ioutil.ReadFile("./services.json")
+	b, _ := ioutil.ReadFile("./services2.json")
 	services := ServicesResponse{}
 	err := json.Unmarshal(b, &services)
 	if err != nil {
@@ -76,82 +297,57 @@ func main() {
 		panic(err)
 	}
 
-	elbsvc := elbv2.New(cfg)
-
-	lbs, err := elbsvc.DescribeLoadBalancersRequest(&elbv2.DescribeLoadBalancersInput{}).Send()
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println(len(lbs.LoadBalancers))
-	//for _, lb := range lbs.LoadBalancers {
-	//	fmt.Println(lb.String())
+	//client, err := newClient()
+	//if err != nil {
+	//	panic(err)
 	//}
 
-	svc := route53.New(cfg)
-	hz, err := svc.ListHostedZonesRequest(&route53.ListHostedZonesInput{}).Send()
+	svc := awssvc{
+		route53: route53.New(cfg),
+		elb:     elbv2.New(cfg),
+		//client:  client,
+	}
+
+	zones, err := svc.GetZones()
 	if err != nil {
 		panic(err)
 	}
 
-	actual := map[key]string{}
-	for _, zone := range hz.HostedZones {
-		records, err := svc.ListResourceRecordSetsRequest(&route53.ListResourceRecordSetsInput{
-			HostedZoneId: zone.Id,
-		}).Send()
-		if err != nil {
-			panic(err)
-		}
-
-		isPrivate := *zone.Config.PrivateZone
-
-		processRecords := func(records []route53.ResourceRecordSet) {
-			for _, record := range records {
-				if record.Type == route53.RRTypeA {
-					name := *record.Name
-					if record.AliasTarget == nil {
-						fmt.Println(record.String())
-						continue
-					}
-					target := *record.AliasTarget.DNSName
-
-					if name[len(name)-1] != '.' {
-						panic("expected ., got: " + name)
-					}
-
-					if target[len(target)-1] != '.' {
-						panic("expected ., got: " + target)
-					}
-					target = target[:len(target)-1]
-					name = name[:len(name)-1]
-					fmt.Println(*zone.Id, isPrivate, name, target)
-
-					actual[key{name, isPrivate}] = target
-				}
-			}
-		}
-
-		processRecords(records.ResourceRecordSets)
-		time.Sleep(time.Second)
-
-		if records.IsTruncated != nil && *records.IsTruncated == true {
-			fmt.Println("TRUNCATED")
-			records, err := svc.ListResourceRecordSetsRequest(&route53.ListResourceRecordSetsInput{
-				HostedZoneId:    zone.Id,
-				StartRecordName: records.NextRecordName,
-				StartRecordType: records.NextRecordType,
-			}).Send()
-			if err != nil {
-				panic(err)
-			}
-			processRecords(records.ResourceRecordSets)
-
-		}
+	for k, zone := range zones {
+		fmt.Println(k, zone)
 	}
+
+	actual, err := svc.GetRecordSets(zones)
+	if err != nil {
+		panic(err)
+	}
+
+	loadbalancers, err := svc.GetLoadBalancers()
+	if err != nil {
+		panic(err)
+	}
+
+	for lb, zone := range loadbalancers {
+		fmt.Println(lb, zone)
+	}
+
+	os.Exit(0)
 
 	for k, target := range expected {
 		pre := ""
 		if target != actual[k] {
+			tld := getTLD(k.domainname)
+			zone, ok := zones[key{domainname: tld, private: k.private}]
+			if !ok {
+				fmt.Printf("missing zone for domain: %s\n", k.domainname)
+				continue
+			}
+
+			fmt.Fprintf(os.Stderr, "updating record for: %s in zone: %s\n", k.domainname, zone)
+			err := svc.UpdateRecord(zone, k.domainname, target)
+			if err != nil {
+				panic(err)
+			}
 			pre = "NEEDS UPDATE "
 		}
 		fmt.Printf("%s %s (private: %t) expected: %s, actual: %s\n", pre, k.domainname, k.private, target, actual[k])
@@ -190,4 +386,21 @@ func newClient() (*http.Client, error) {
 	}
 
 	return client, nil
+}
+
+func stripLastDot(target string) string {
+	if target[len(target)-1] != '.' {
+		panic("expected ., got: " + target)
+	}
+	return target[:len(target)-1]
+}
+
+func getTLD(target string) string {
+	parts := strings.Split(target, ".")
+	if len(parts) < 3 {
+		panic("expected at least 3 parts in domain")
+	}
+
+	tld := parts[len(parts)-2:]
+	return strings.Join(tld, ".")
 }
