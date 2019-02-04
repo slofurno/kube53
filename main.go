@@ -59,6 +59,10 @@ func withretry(f func() error) error {
 		if err = f(); err == nil {
 			return nil
 		}
+
+		if !aws.IsErrorRetryable(err) {
+			return err
+		}
 		time.Sleep(time.Second + time.Millisecond*400*(1<<i))
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 	}
@@ -83,28 +87,28 @@ func processRecords(records []route53.ResourceRecordSet, actual map[key]string, 
 func (s *awssvc) UpdateRecord(zone, dnsname, target, targetzone string) error {
 	parts := strings.Split(zone, "/")
 	zone = parts[len(parts)-1]
-	//return withretry(func() error {
-	_, err := s.route53.ChangeResourceRecordSetsRequest(&route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(zone),
-		ChangeBatch: &route53.ChangeBatch{
-			Changes: []route53.Change{
-				route53.Change{
-					Action: "UPSERT",
-					ResourceRecordSet: &route53.ResourceRecordSet{
-						Type: route53.RRTypeA,
-						Name: aws.String(dnsname + "."),
-						AliasTarget: &route53.AliasTarget{
-							DNSName:              aws.String(target + "."),
-							HostedZoneId:         aws.String(targetzone),
-							EvaluateTargetHealth: aws.Bool(false),
+	return withretry(func() error {
+		_, err := s.route53.ChangeResourceRecordSetsRequest(&route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: aws.String(zone),
+			ChangeBatch: &route53.ChangeBatch{
+				Changes: []route53.Change{
+					route53.Change{
+						Action: "UPSERT",
+						ResourceRecordSet: &route53.ResourceRecordSet{
+							Type: route53.RRTypeA,
+							Name: aws.String(dnsname + "."),
+							AliasTarget: &route53.AliasTarget{
+								DNSName:              aws.String(target + "."),
+								HostedZoneId:         aws.String(targetzone),
+								EvaluateTargetHealth: aws.Bool(false),
+							},
 						},
 					},
 				},
 			},
-		},
-	}).Send()
-	return err
-	//})
+		}).Send()
+		return err
+	})
 }
 
 func (s *awssvc) GetExpectedRecordSets() (map[key]string, error) {
@@ -264,46 +268,20 @@ func (s *awssvc) GetLoadBalancers() (map[string]string, error) {
 
 func main() {
 
-	b, _ := ioutil.ReadFile("./services.json")
-	services := ServicesResponse{}
-	err := json.Unmarshal(b, &services)
-	if err != nil {
-		panic(err)
-	}
-
-	expected := map[key]string{}
-
-	for _, service := range services.Items {
-		private := service.Metadata.Annotations.Internal != ""
-		if len(service.Status.LoadBalancer.Ingress) > 0 {
-			if len(service.Status.LoadBalancer.Ingress) != 1 {
-				panic("unexpected ingress length")
-			}
-
-			domainname := service.Metadata.Annotations.DomainName
-			if domainname == "" {
-				continue
-			}
-			elb := service.Status.LoadBalancer.Ingress[0].Hostname
-			fmt.Println(private, domainname, elb)
-			expected[key{domainname, private}] = elb
-		}
-	}
-
 	cfg, err := external.LoadDefaultAWSConfig()
 	if err != nil {
 		panic(err)
 	}
 
-	//client, err := newClient()
-	//if err != nil {
-	//	panic(err)
-	//}
+	client, err := newClient()
+	if err != nil {
+		panic(err)
+	}
 
 	svc := awssvc{
 		route53: route53.New(cfg),
 		elb:     elb.New(cfg),
-		//client:  client,
+		client:  client,
 	}
 
 	zones, err := svc.GetZones()
@@ -326,6 +304,11 @@ func main() {
 	}
 
 	for {
+		expected, err := svc.GetExpectedRecordSets()
+		if err != nil {
+			panic(err)
+		}
+
 		fmt.Fprintln(os.Stderr, "comparing expected to actual records")
 		for k, target := range expected {
 			pre := ""
@@ -355,7 +338,7 @@ func main() {
 			fmt.Printf("%s %s (private: %t) expected: %s, actual: %s\n", pre, k.domainname, k.private, target, actual[k])
 		}
 
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Second * 40)
 	}
 
 }
