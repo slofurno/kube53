@@ -311,7 +311,7 @@ func main() {
 
 		fmt.Fprintln(os.Stderr, "comparing expected to actual records")
 		for k, target := range expected {
-			pre := ""
+			fmt.Printf("%s (private: %t) expected: %s, actual: %s\n", k.domainname, k.private, target, actual[k])
 			if target != actual[k] {
 				tld := getTLD(k.domainname)
 				zone, ok := zones[key{domainname: tld, private: k.private}]
@@ -337,9 +337,7 @@ func main() {
 				} else {
 					actual[k] = target
 				}
-				pre = "NEEDS UPDATE "
 			}
-			fmt.Printf("%s %s (private: %t) expected: %s, actual: %s\n", pre, k.domainname, k.private, target, actual[k])
 		}
 
 		time.Sleep(time.Second * 40)
