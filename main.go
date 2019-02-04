@@ -323,6 +323,10 @@ func main() {
 				targetzone, ok := loadbalancers[target]
 				if !ok {
 					fmt.Printf("missing target zone for elb: %s\n", target)
+					loadbalancers, err = svc.GetLoadBalancers()
+					if err != nil {
+						panic(err)
+					}
 					continue
 				}
 
