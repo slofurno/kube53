@@ -288,26 +288,26 @@ func main() {
 		client:  client,
 	}
 
-	zones, err := svc.GetZones()
-	if err != nil {
-		panic(err)
-	}
-
-	for k, zone := range zones {
-		fmt.Fprintln(dev, k, zone)
-	}
-
-	actual, err := svc.GetRecordSets(zones)
-	if err != nil {
-		panic(err)
-	}
-
-	loadbalancers, err := svc.GetLoadBalancers()
-	if err != nil {
-		panic(err)
-	}
-
 	for {
+		zones, err := svc.GetZones()
+		if err != nil {
+			panic(err)
+		}
+
+		for k, zone := range zones {
+			fmt.Fprintln(dev, k, zone)
+		}
+
+		actual, err := svc.GetRecordSets(zones)
+		if err != nil {
+			panic(err)
+		}
+
+		loadbalancers, err := svc.GetLoadBalancers()
+		if err != nil {
+			panic(err)
+		}
+
 		expected, err := svc.GetExpectedRecordSets()
 		if err != nil {
 			panic(err)
@@ -329,10 +329,6 @@ func main() {
 				targetzone, ok := loadbalancers[target]
 				if !ok {
 					fmt.Fprintf(dev, "missing target zone for elb: %s\n", target)
-					loadbalancers, err = svc.GetLoadBalancers()
-					if err != nil {
-						panic(err)
-					}
 					continue
 				}
 
@@ -346,7 +342,7 @@ func main() {
 			}
 		}
 
-		time.Sleep(time.Second * 40)
+		time.Sleep(time.Second * 120)
 	}
 
 }
