@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/external"
 	"github.com/aws/aws-sdk-go-v2/service/elb"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
+	"github.com/pkg/errors"
 )
 
 type Service struct {
@@ -289,59 +291,64 @@ func main() {
 	}
 
 	for {
-		zones, err := svc.GetZones()
-		if err != nil {
-			panic(err)
-		}
+		err := func() error {
+			zones, err := svc.GetZones()
+			if err != nil {
+				return errors.Wrap(err, "error getting zones")
+			}
 
-		for k, zone := range zones {
-			fmt.Fprintln(dev, k, zone)
-		}
+			for k, zone := range zones {
+				fmt.Fprintln(dev, k, zone)
+			}
 
-		actual, err := svc.GetRecordSets(zones)
-		if err != nil {
-			panic(err)
-		}
+			actual, err := svc.GetRecordSets(zones)
+			if err != nil {
+				return errors.Wrap(err, "error gettting record sets")
+			}
 
-		loadbalancers, err := svc.GetLoadBalancers()
-		if err != nil {
-			panic(err)
-		}
+			loadbalancers, err := svc.GetLoadBalancers()
+			if err != nil {
+				return errors.Wrap(err, "error getting load balancers")
+			}
 
-		expected, err := svc.GetExpectedRecordSets()
-		if err != nil {
-			panic(err)
-		}
+			expected, err := svc.GetExpectedRecordSets()
+			if err != nil {
+				return errors.Wrap(err, "error getting service expected records")
+			}
 
-		fmt.Fprintln(dev, "comparing expected to actual records")
-		for k, target := range expected {
-			fmt.Fprintf(dev, "%s (private: %t) expected: %s, actual: %s\n", k.domainname, k.private, target, actual[k])
-			if target != actual[k] {
+			fmt.Fprintln(dev, "comparing expected to actual records")
+			for k, target := range expected {
+				fmt.Fprintf(dev, "%s (private: %t) expected: %s, actual: %s\n", k.domainname, k.private, target, actual[k])
+				if target != actual[k] {
 
-				fmt.Fprintf(os.Stderr, "setting target for %s from %s -> %s\n", k.domainname, actual[k], target)
-				tld := getTLD(k.domainname)
-				zone, ok := zones[key{domainname: tld, private: k.private}]
-				if !ok {
-					fmt.Fprintf(dev, "missing zone for domain: %s\n", k.domainname)
-					continue
-				}
+					fmt.Fprintf(os.Stderr, "setting target for %s from %s -> %s\n", k.domainname, actual[k], target)
+					tld := getTLD(k.domainname)
+					zone, ok := zones[key{domainname: tld, private: k.private}]
+					if !ok {
+						fmt.Fprintf(dev, "missing zone for domain: %s\n", k.domainname)
+						continue
+					}
 
-				targetzone, ok := loadbalancers[target]
-				if !ok {
-					fmt.Fprintf(dev, "missing target zone for elb: %s\n", target)
-					continue
-				}
+					targetzone, ok := loadbalancers[target]
+					if !ok {
+						fmt.Fprintf(dev, "missing target zone for elb: %s\n", target)
+						continue
+					}
 
-				fmt.Fprintf(dev, "updating record for: %s in zone: %s\n", k.domainname, zone)
-				err := svc.UpdateRecord(zone, k.domainname, target, targetzone)
-				if err != nil {
-					fmt.Fprintln(dev, err)
-				} else {
-					actual[k] = target
+					fmt.Fprintf(dev, "updating record for: %s in zone: %s\n", k.domainname, zone)
+					err := svc.UpdateRecord(zone, k.domainname, target, targetzone)
+					if err != nil {
+						fmt.Fprintln(dev, err)
+					} else {
+						actual[k] = target
+					}
 				}
 			}
+			return nil
+		}()
+		if err != nil {
+			log.Println(err)
 		}
-
 		time.Sleep(time.Second * 120)
 	}
 
